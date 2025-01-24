@@ -7,6 +7,7 @@ type Memory struct {
 	Content   string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	UserID    int
 }
 
 type CreateMemoryParams struct {

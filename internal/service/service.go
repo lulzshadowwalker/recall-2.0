@@ -11,9 +11,13 @@ type Repository interface {
 }
 
 type service struct {
-	r Repository
+	Repository Repository
+}
+
+func NewService(r Repository) *service {
+	return &service{r}
 }
 
 func (s *service) Create(ctx context.Context, params internal.CreateMemoryParams) (internal.Memory, error) {
-	return s.r.Create(ctx, params)
+	return s.Repository.Create(ctx, params)
 }
