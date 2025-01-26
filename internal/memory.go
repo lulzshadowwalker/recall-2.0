@@ -11,5 +11,6 @@ type Memory struct {
 }
 
 type CreateMemoryParams struct {
-	content string
+	Content string
+	UserID  int
 }

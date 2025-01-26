@@ -1,12 +1,18 @@
 package app
 
 import (
+	"context"
 	"errors"
-	"net/http"
+	"log/slog"
+	"os"
 	"regexp"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"github.com/lulzshadowwalker/recall/internal/http/handler"
+	"github.com/lulzshadowwalker/recall/internal/psql"
 )
 
 const (
@@ -16,29 +22,21 @@ const (
 )
 
 type App struct {
-	router *http.ServeMux
-	server *http.Server
+	Echo    *echo.Echo
+	addr    string
+	timeout time.Duration
+	db      *pgxpool.Pool
 }
 
 type AppOption func(*App) error
 
-// TODO: This does not belong here
-// would be nice to have something like homeHandler.Index.Unwrap()
-type DecoratedHandler func(w http.ResponseWriter, r *http.Request) error
-
 func New(opts ...AppOption) (*App, error) {
-	router := http.NewServeMux()
-	homeHandler := handler.HomeHandler{}
-	router.HandleFunc("/", homeHandler.Index) //  TODO: Add decorated handler
+	e := echo.New()
 
 	app := &App{
-		router: router,
-		server: &http.Server{
-			Addr:         AppDefaultAddr,
-			Handler:      router,
-			ReadTimeout:  AppDefaultReadTimeout,
-			WriteTimeout: AppDefaultWriteTimeout,
-		},
+		timeout: AppDefaultReadTimeout,
+		addr:    AppDefaultAddr,
+		Echo:    e,
 	}
 
 	for _, opt := range opts {
@@ -47,11 +45,54 @@ func New(opts ...AppOption) (*App, error) {
 		}
 	}
 
+	if app.db == nil {
+		return nil, errors.New("db cannot be nil")
+	}
+
+	{
+		mh := handler.NewMemoryHandler(psql.NewMemory(app.db))
+		e.POST("/memories", mh.Create)
+		e.GET("/memories", mh.Index)
+		e.DELETE("/memories/:memory", mh.Delete)
+	}
+
+	//  NOTE: Middlewares should be added after all options are applied
+	e.Use(middleware.TimeoutWithConfig(middleware.TimeoutConfig{
+		Timeout: app.timeout,
+	}))
+
+	e.Validator = NewRecallValidator()
+
+	e.HTTPErrorHandler = recallHTTPErrorHandler
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		LogStatus: true,
+		LogURI:    true,
+		LogError:  true,
+		// HandleError: true, // forwards error to the global error handler, so it can decide appropriate status code
+		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+			if v.Error == nil {
+				logger.LogAttrs(context.Background(), slog.LevelInfo, "REQUEST",
+					slog.String("uri", v.URI),
+					slog.Int("status", v.Status),
+				)
+			} else {
+				logger.LogAttrs(context.Background(), slog.LevelError, "REQUEST_ERROR",
+					slog.String("uri", v.URI),
+					slog.Int("status", v.Status),
+					slog.String("err", v.Error.Error()),
+				)
+			}
+			return nil
+		},
+	}))
+
 	return app, nil
 }
 
 func (a *App) Start() error {
-	return a.server.ListenAndServe()
+	return a.Echo.Start(a.addr)
 }
 
 func (a *App) WithAddr(addr string) AppOption {
@@ -65,33 +106,38 @@ func (a *App) WithAddr(addr string) AppOption {
 			return errors.New("addr must be in format :<port>")
 		}
 
-		a.server.Addr = addr
+		a.addr = addr
 		return nil
 	}
 }
 
-func WithReadTimeout(d time.Duration) AppOption {
+func WithTimeout(d time.Duration) AppOption {
 	return func(a *App) error {
-		a.server.ReadTimeout = d
+		if d < 0 {
+			return errors.New("timeout cannot be negative")
+		}
+
+		a.timeout = d
+
 		return nil
 	}
 }
 
-func (a *App) WithWriteTimeout(d time.Duration) AppOption {
+func WithDB(db *pgxpool.Pool) AppOption {
 	return func(a *App) error {
-		a.server.WriteTimeout = d
+		a.db = db
 		return nil
 	}
+}
+
+func (a *App) Close() {
+	a.db.Close()
 }
 
 func (a *App) Addr() string {
-	return a.server.Addr
+	return a.addr
 }
 
-func (a *App) ReadTimeout() time.Duration {
-	return a.server.ReadTimeout
-}
-
-func (a *App) WriteTimeout() time.Duration {
-	return a.server.WriteTimeout
+func (a *App) Timeout() time.Duration {
+	return a.timeout
 }
